@@ -1,6 +1,8 @@
 #include "gps.h"
 #include <math.h>
 
+GpsData gpsData;
+
 static HardwareSerial GPSSerial(2);
 
 static constexpr float MMS_TO_KT = 1.0f / 514.444f;
@@ -30,13 +32,13 @@ static void sendUBX(const uint8_t* pkt, size_t len) {
 
 // Construye y envía un CFG-VALSET con una sola clave/valor
 static void sendCfgValset(uint32_t key, const uint8_t* val, uint8_t valLen) {
-  uint16_t payloadLen = 4 + 4 + valLen;  // cabecera(4) + clave(4) + valor
+  uint16_t payloadLen = 4 + 4 + valLen;
   uint8_t  pkt[32];
   pkt[0] = 0xB5; pkt[1] = 0x62;
   pkt[2] = 0x06; pkt[3] = 0x8A;
   pkt[4] = payloadLen & 0xFF; pkt[5] = (payloadLen >> 8) & 0xFF;
-  pkt[6] = 0x00; pkt[7] = 0x01;          // version=0, layers=RAM
-  pkt[8] = 0x00; pkt[9] = 0x00;          // reserved
+  pkt[6] = 0x00; pkt[7] = 0x01;
+  pkt[8] = 0x00; pkt[9] = 0x00;
   pkt[10] = key & 0xFF; pkt[11] = (key >> 8) & 0xFF;
   pkt[12] = (key >> 16) & 0xFF; pkt[13] = (key >> 24) & 0xFF;
   for (uint8_t i = 0; i < valLen; i++) pkt[14 + i] = val[i];
@@ -60,10 +62,14 @@ static void configureGPS() {
 
 // ── Procesado NAV-PVT ────────────────────────────────────────────────
 static void processNavPVT(const uint8_t* buf) {
-  uint8_t  fixType = buf[20];
-  uint8_t  numSV   = buf[23];
+  uint8_t fixType = buf[20];
+  uint8_t numSV   = buf[23];
 
-  if (fixType < 2) {
+  gpsData.sats    = numSV;
+  gpsData.hasFix  = (fixType >= 2);
+  gpsData.updated = true;
+
+  if (!gpsData.hasFix) {
     Serial.print("Sin fix | Sat: "); Serial.println(numSV);
     return;
   }
@@ -88,8 +94,12 @@ static void processNavPVT(const uint8_t* buf) {
 
   float speed_raw = sqrtf(vn * vn + ve * ve);
   float speed_avg = sqrtf(vn_avg * vn_avg + ve_avg * ve_avg);
-  float hdg_raw   = atan2f(ve, vn)     * RAD_TO_DEG; if (hdg_raw < 0) hdg_raw += 360;
+  float hdg_raw   = atan2f(ve, vn)         * RAD_TO_DEG; if (hdg_raw < 0) hdg_raw += 360;
   float hdg_avg   = atan2f(ve_avg, vn_avg) * RAD_TO_DEG; if (hdg_avg < 0) hdg_avg += 360;
+
+  gpsData.speed_kt = speed_avg;
+  gpsData.hdg_deg  = hdg_avg;
+  gpsData.sAcc_mms = sAcc;
 
   Serial.print("Sat:"); Serial.print(numSV);
   Serial.print(" | sAcc:"); Serial.print(sAcc); Serial.print("mm/s");
@@ -97,7 +107,7 @@ static void processNavPVT(const uint8_t* buf) {
   Serial.print(" avg:"); Serial.print(speed_avg, 3); Serial.print(" kt");
   if (speed_avg > MIN_SPEED_KT) {
     Serial.print(" | Hdg raw:"); Serial.print(hdg_raw, 1);
-    Serial.print(" avg:"); Serial.print(hdg_avg, 1); Serial.print("°");
+    Serial.print(" avg:"); Serial.print(hdg_avg, 1); Serial.print("deg");
   } else {
     Serial.print(" | Hdg: --- (parado)");
   }
