@@ -1,80 +1,86 @@
-#include <Arduino.h>
-#include <TinyGPS++.h>
-#include <HardwareSerial.h>
+#include <Wire.h>
+#include <SparkFun_u-blox_GNSS_v3.h>
+#include <math.h>
 
-TinyGPSPlus gps;
-HardwareSerial GPSSerial(2); // UART2
+SFE_UBLOX_GNSS gps;
 
-// Config Moving Average Mean
-const int N = 4;           // Ventana (muestras). Ajusta según respuesta deseada
-float vx_buf[N] = {0};     // Componente Este  (speed * sin(heading))
-float vy_buf[N] = {0};     // Componente Norte (speed * cos(heading))
-int buf_idx = 0;
+// --- Moving average vectorial ---
+constexpr int N = 10;
+constexpr float MMS_TO_KT  = 1.0f / 514.444f;   // mm/s to knots
+constexpr float MIN_SPEED_KT = 0.15f;           // noise threshold
 
-// Below this speed, the velocity is not reliable
-const float MIN_SPEED_KT = 0.9;
+float vn_buf[N] = {0};  // North [kt]
+float ve_buf[N] = {0};  // East  [kt]
+int   buf_idx   = 0;
 
 void setup() {
   Serial.begin(115200);
-  GPSSerial.begin(38400, SERIAL_8N1, 16, 17); // RX=16, TX=17
-  Serial.println("Esperando señal GPS...");
+  Wire.begin(21, 22);  // SDA, SCL
+
+  if (!gps.begin()) {
+    Serial.println("GPS not found on I2C — check connections");
+    while (1);
+  }
+
+  gps.setI2COutput(COM_TYPE_UBX);  // Solo protocolo UBX, sin NMEA
+  gps.setNavigationFrequency(5);   // 5 Hz — más muestras para el promedio
+  gps.setAutoPVT(true);            // Push automático, sin polling
+  gps.saveConfiguration();
+
+  Serial.println("GPS initialized — waiting fix...");
 }
 
 void loop() {
-  while (GPSSerial.available() > 0) {
-    gps.encode(GPSSerial.read());
+  if (!gps.getPVT()) return;
+
+  uint8_t fixType = gps.getFixType();
+  uint8_t numSV   = gps.getSIV();
+
+  if (fixType < 2) {
+    Serial.print("Sin fix | Satélites: "); Serial.println(numSV);
+    return;
   }
 
-  static unsigned long last = 0;
-  if (millis() - last > 1000) {
-    last = millis();
+  // Velocidad vectorial cruda en mm/s (int32 — alta resolución)
+  int32_t velN_raw = gps.getNedNorthVel();   // Norte  mm/s
+  int32_t velE_raw = gps.getNedEastVel();   // Este   mm/s
+  uint32_t sAcc   = gps.getSpeedAccEst(); // Estimación de error (mm/s)
 
-    if (!gps.location.isValid()) {
-      Serial.print("Satélites: "); Serial.print(gps.satellites.value());
-      Serial.println(" | No fix...");
-      return;
-    }
+  // Convertir a nudos manteniendo signo
+  float vn = velN_raw * MMS_TO_KT;
+  float ve = velE_raw * MMS_TO_KT;
 
-    float speed_kt  = gps.speed.knots();
-    float course_deg = gps.course.isValid() ? gps.course.deg() : 0.0;
-    float course_rad = course_deg * DEG_TO_RAD;
+  // Buffer circular
+  vn_buf[buf_idx] = vn;
+  ve_buf[buf_idx] = ve;
+  buf_idx = (buf_idx + 1) % N;
 
-    // Decompose cartesian speed (North = 0 DEG)
-    float vx = speed_kt * sin(course_rad);
-    float vy = speed_kt * cos(course_rad);
-    // float vx = (speed_kt > MIN_SPEED_KT) ? speed_kt * sin(course_rad) : 0.0;
-    // float vy = (speed_kt > MIN_SPEED_KT) ? speed_kt * cos(course_rad) : 0.0;
-
-    // Insert in cyclic buffer
-    vx_buf[buf_idx] = vx;
-    vy_buf[buf_idx] = vy;
-    buf_idx = (buf_idx + 1) % N;
-    
-    // Compute average speed
-    float vx_avg = 0, vy_avg = 0;
-    for (int i = 0; i < N; i++) {
-      vx_avg += vx_buf[i];
-      vy_avg += vy_buf[i];
-    }
-    vx_avg /= N;
-    vy_avg /= N;
-
-    // Speed (SOG) and heading
-    float speed_smooth  = sqrt(vx_avg * vx_avg + vy_avg * vy_avg);
-    float heading_smooth = atan2(vx_avg, vy_avg) * RAD_TO_DEG;
-    if (heading_smooth < 0) heading_smooth += 360.0;
-
-    // Output
-    Serial.print("Sat: ");      Serial.print(gps.satellites.value());
-    Serial.print(" | Vel raw: "); Serial.print(speed_kt, 2);     Serial.print(" kt");
-    Serial.print(" | Vel avg: "); Serial.print(speed_smooth, 2); Serial.print(" kt");
-
-    if (speed_smooth > MIN_SPEED_KT) {
-      Serial.print(" | Rumbo raw: "); Serial.print(course_deg, 1);    Serial.print("°");
-      Serial.print(" | Rumbo avg: "); Serial.print(heading_smooth, 1); Serial.print("°");
-    } else {
-      Serial.print(" | Rumbo: --- (parado)");
-    }
-    Serial.println();
+  // Vector promedio
+  float vn_avg = 0, ve_avg = 0;
+  for (int i = 0; i < N; i++) {
+    vn_avg += vn_buf[i];
+    ve_avg += ve_buf[i];
   }
+  vn_avg /= N;
+  ve_avg /= N;
+
+  float speed_raw = sqrt(vn * vn + ve * ve);
+  float speed_avg = sqrt(vn_avg * vn_avg + ve_avg * ve_avg);
+
+  float hdg_raw = atan2(ve, vn)         * RAD_TO_DEG; if (hdg_raw < 0) hdg_raw += 360;
+  float hdg_avg = atan2(ve_avg, vn_avg) * RAD_TO_DEG; if (hdg_avg < 0) hdg_avg += 360;
+
+  // Output
+  Serial.print("Sat:"); Serial.print(numSV);
+  Serial.print(" | sAcc:"); Serial.print(sAcc); Serial.print("mm/s");
+  Serial.print(" | VN:"); Serial.print(velN_raw); Serial.print(" VE:"); Serial.print(velE_raw); Serial.print(" mm/s");
+  Serial.print(" | Vel raw:"); Serial.print(speed_raw, 3);
+  Serial.print(" avg:"); Serial.print(speed_avg, 3); Serial.print(" kt");
+  if (speed_avg > MIN_SPEED_KT) {
+    Serial.print(" | Hdg raw:"); Serial.print(hdg_raw, 1);
+    Serial.print(" avg:"); Serial.print(hdg_avg, 1); Serial.print("°");
+  } else {
+    Serial.print(" | Hdg: --- (parado)");
+  }
+  Serial.println();
 }
